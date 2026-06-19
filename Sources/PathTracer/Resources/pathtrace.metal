@@ -1288,3 +1288,131 @@ kernel void instNormals(device float4*                    accum     [[buffer(0)]
     float3 c = h.valid ? (0.5 * (h.ns + 1.0)) : skyColor(r.direction, u);
     accum[idx] = float4(c, 1.0);
 }
+
+// Minimal deferred G-buffer export for the instanced/textured path (Sponza),
+// for neural deferred shading. Writes 10 floats/pixel: hit, shading normal(xyz),
+// textured albedo(xyz), world hit position(xyz). Albedo is sampled from the
+// diffuse texture at the hit UV (Sponza's materials are flat gray — the detail
+// lives entirely in the textures), so the network receives the *good* materials.
+// The host normalises the position afterwards to match the training layout.
+kernel void instExportGBuffer(device float*                   gbuf      [[buffer(0)]],
+                              constant IslandUniforms&         u         [[buffer(1)]],
+                              const device float3*             positions [[buffer(2)]],
+                              const device float3*             normals   [[buffer(3)]],
+                              const device uint*               indices   [[buffer(4)]],
+                              const device InstanceData*       instances [[buffer(5)]],
+                              const device Material*           materials [[buffer(6)]],
+                              instance_acceleration_structure  accel     [[buffer(7)]],
+                              const device float2*             uvs       [[buffer(8)]],
+                              array<texture2d<float>, 32>      albedoTex [[texture(0)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= u.imageSize.x || gid.y >= u.imageSize.y) return;
+    uint idx = gid.y * u.imageSize.x + gid.x;
+    uint b = idx * 10u;
+    InstRefs s{positions, normals, uvs, indices, instances, materials};
+    constexpr sampler smp(coord::normalized, address::repeat, filter::linear, mip_filter::linear, max_anisotropy(8));
+    bool texOff = (u.flags >> 3) & 1u;
+    RNG rng; rng.state = pcgHash(idx + 1u);
+    ray r = makeCameraRayCam(u.camera, u.imageSize, float2(gid), rng);
+    Hit h = traceClosestInstAT(r, accel, s, albedoTex, smp);
+    if (!h.valid) { for (uint k = 0; k < 10u; ++k) gbuf[b + k] = 0.0; return; }
+    float3 woW = -r.direction;
+    float3 nsf = (dot(h.ns, woW) < 0.0) ? -h.ns : h.ns;
+    Material m = s.materials[h.matId];
+    float3 albedo = m.baseColor;
+    if (m.texId >= 0.0 && !texOff)
+        albedo = albedoTex[(uint)m.texId].sample(smp, float2(h.uv.x, 1.0 - h.uv.y)).rgb;
+    gbuf[b + 0] = 1.0;
+    gbuf[b + 1] = nsf.x; gbuf[b + 2] = nsf.y; gbuf[b + 3] = nsf.z;
+    gbuf[b + 4] = albedo.x; gbuf[b + 5] = albedo.y; gbuf[b + 6] = albedo.z;
+    gbuf[b + 7] = h.pos.x; gbuf[b + 8] = h.pos.y; gbuf[b + 9] = h.pos.z;
+}
+
+//===----------------------------------------------------------------------===//
+// Realtime per-pixel neural shader. One thread per pixel runs a small fixed MLP
+// (matches research/neural_shader.py: PerPixelShader) over the deferred G-buffer
+// to predict the converged sun+sky radiance — the trained weights fold straight
+// into the render loop, no path tracing and no Python. Misses get the analytic
+// sky. Hard-wired: raw9(normal,albedo,pos) standardized + 4-band Fourier of
+// position -> 33 -> 64 -> 64 -> 64 -> 3 (GELU). Weights are half precision in the
+// `constant` cache and activations ping-pong in two small half buffers, so the
+// kernel keeps high occupancy (no register spilling) and runs at frame rate.
+//===----------------------------------------------------------------------===//
+constant int NS_RAW = 9;
+constant int NS_BANDS = 4;
+constant int NS_IN = 33;          // NS_RAW + 3 * 2 * NS_BANDS
+constant int NS_H = 64;
+
+inline float nsErf(float x) {                       // Abramowitz & Stegun 7.1.26 (~1e-7)
+    float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
+    float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
+                       - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return (x < 0.0f ? -1.0f : 1.0f) * y;
+}
+inline float nsGelu(float x) { return 0.5f * x * (1.0f + nsErf(x * 0.70710678f)); }
+
+kernel void neuralShadeInst(device float4*            accum [[buffer(0)]],
+                            constant IslandUniforms&   u    [[buffer(1)]],
+                            const device float*        gbuf [[buffer(2)]],   // 10ch G-buffer
+                            const device float*        norm [[buffer(3)]],   // mean9,std9,centre3,invE
+                            constant half*             W1   [[buffer(4)]],
+                            constant half*             B1   [[buffer(5)]],
+                            constant half*             W2   [[buffer(6)]],
+                            constant half*             B2   [[buffer(7)]],
+                            constant half*             W3   [[buffer(8)]],
+                            constant half*             B3   [[buffer(9)]],
+                            constant half*             W4   [[buffer(10)]],
+                            constant half*             B4   [[buffer(11)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= u.imageSize.x || gid.y >= u.imageSize.y) return;
+    uint idx = gid.y * u.imageSize.x + gid.x;
+    uint b = idx * 10u;
+    if (gbuf[b] < 0.5f) {                                   // miss -> analytic sky
+        RNG rng; rng.state = pcgHash(idx + 1u);
+        ray r = makeCameraRayCam(u.camera, u.imageSize, float2(gid), rng);
+        accum[idx] = float4(skyColor(r.direction, u), 1.0);
+        return;
+    }
+    // raw9 = [normal.xyz, albedo.xyz, posScaled.xyz]; scene-normalize the position
+    // (centre/extent in norm[18..21]) then standardize, to match the training layout.
+    float3 center = float3(norm[18], norm[19], norm[20]);
+    float invE = norm[21];
+    float raw9[NS_RAW];
+    raw9[0] = gbuf[b + 1]; raw9[1] = gbuf[b + 2]; raw9[2] = gbuf[b + 3];
+    raw9[3] = gbuf[b + 4]; raw9[4] = gbuf[b + 5]; raw9[5] = gbuf[b + 6];
+    raw9[6] = (gbuf[b + 7] - center.x) * invE;
+    raw9[7] = (gbuf[b + 8] - center.y) * invE;
+    raw9[8] = (gbuf[b + 9] - center.z) * invE;
+    float inp[NS_IN];
+    for (int i = 0; i < NS_RAW; ++i) inp[i] = (raw9[i] - norm[i]) / norm[NS_RAW + i];
+    int o = NS_RAW;                                         // ++ Fourier(position)
+    for (int c = 0; c < 3; ++c) {
+        float p = inp[6 + c];
+        for (int k = 0; k < NS_BANDS; ++k) inp[o++] = sin(exp2((float)k) * M_PI_F * p);
+        for (int k = 0; k < NS_BANDS; ++k) inp[o++] = cos(exp2((float)k) * M_PI_F * p);
+    }
+    half cur[NS_H], nxt[NS_H];
+    for (int q = 0; q < NS_H; ++q) {                        // layer 1: IN -> H
+        float a = float(B1[q]);
+        for (int i = 0; i < NS_IN; ++i) a += float(W1[q * NS_IN + i]) * inp[i];
+        cur[q] = half(nsGelu(a));
+    }
+    for (int q = 0; q < NS_H; ++q) {                        // layer 2: H -> H
+        float a = float(B2[q]);
+        for (int i = 0; i < NS_H; ++i) a += float(W2[q * NS_H + i]) * float(cur[i]);
+        nxt[q] = half(nsGelu(a));
+    }
+    for (int q = 0; q < NS_H; ++q) {                        // layer 3: H -> H
+        float a = float(B3[q]);
+        for (int i = 0; i < NS_H; ++i) a += float(W3[q * NS_H + i]) * float(nxt[i]);
+        cur[q] = half(nsGelu(a));
+    }
+    float ol[3];                                           // layer 4: H -> 3
+    for (int oo = 0; oo < 3; ++oo) {
+        float a = float(B4[oo]);
+        for (int i = 0; i < NS_H; ++i) a += float(W4[oo * NS_H + i]) * float(cur[i]);
+        ol[oo] = a;
+    }
+    float3 rad = max(exp(float3(ol[0], ol[1], ol[2])) - 1.0, 0.0);   // expm1 (log -> linear)
+    accum[idx] = float4(rad, 1.0);
+}

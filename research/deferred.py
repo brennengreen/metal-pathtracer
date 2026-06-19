@@ -47,13 +47,21 @@ def metrics(pred, ref, eps=1e-2):
 
 
 def load_images(path):
-    """Reshape the flat per-pixel export back into per-view images."""
+    """Load a per-view export into images + the minimal G-buffer channels, handling
+    both formats: the jittered-views dataset (X.bin, 21-dim → slice GBUF_COLS) and
+    the orbit-sequence dataset (Xseq.bin, already the 10-ch textured G-buffer)."""
     meta = json.load(open(os.path.join(path, "meta.json")))
-    n, d = meta["n"], meta["inDim"]
-    W, H, V = meta["width"], meta["height"], meta["views"]
-    X = np.fromfile(os.path.join(path, "X.bin"), dtype=np.float32).reshape(V, H, W, d)
-    Y = np.fromfile(os.path.join(path, "Y.bin"), dtype=np.float32).reshape(V, H, W, 3)
-    return meta, X, Y
+    W, H = meta["width"], meta["height"]
+    if os.path.exists(os.path.join(path, "Xseq.bin")):          # instanced/textured sequence
+        F = meta["frames"]; GB = meta["gbuf"]
+        Xg = np.fromfile(os.path.join(path, "Xseq.bin"), np.float32).reshape(F, H, W, GB)
+        Y = np.fromfile(os.path.join(path, "Yseq.bin"), np.float32).reshape(F, H, W, 3)
+        nval = max(4, F // 5)
+        return meta, Xg, Y, list(range(F - nval)), list(range(F - nval, F))
+    V, d = meta["views"], meta["inDim"]                          # jittered-views, 21-dim
+    X = np.fromfile(os.path.join(path, "X.bin"), np.float32).reshape(V, H, W, d)
+    Y = np.fromfile(os.path.join(path, "Y.bin"), np.float32).reshape(V, H, W, 3)
+    return meta, X[..., GBUF_COLS], Y, meta["trainViews"], meta["valViews"]
 
 
 # --- compact U-Net ----------------------------------------------------------
@@ -110,18 +118,18 @@ def main():
     dev = torch.device("mps" if torch.backends.mps.is_available()
                        else "cuda" if torch.cuda.is_available() else "cpu")
 
-    meta, X, Y = load_images(args.data)
+    meta, Xg, Y, train_v, val_v = load_images(args.data)
     H, W = meta["height"], meta["width"]
-    train_v, val_v = meta["trainViews"], meta["valViews"]
-    print(f"device={dev}  scene={meta.get('scene','?')}  views={meta['views']}  "
-          f"{W}x{H}  train={len(train_v)}  val={len(val_v)}  in_ch={len(GBUF_COLS)}")
+    GB = Xg.shape[-1]
+    print(f"device={dev}  scene={meta.get('scene','?')}  frames/views={Xg.shape[0]}  "
+          f"{W}x{H}  train={len(train_v)}  val={len(val_v)}  in_ch={GB}")
 
-    Xg = X[..., GBUF_COLS]                            # [V,H,W,10] minimal G-buffer
     Ylog = np.log1p(np.maximum(Y, 0.0))              # HDR-aware target
 
     # Standardise input channels using TRAIN views only.
-    flat = Xg[train_v].reshape(-1, len(GBUF_COLS))
+    flat = Xg[train_v].reshape(-1, GB)
     mean, std = flat.mean(0), flat.std(0) + 1e-6
+    alb_fig = Xg[val_v[0]][..., 4:7].copy()          # raw albedo of 1st held-out frame (for figure)
     Xg = (Xg - mean) / std
 
     def to_chw(a):                                    # [V,H,W,C] -> tensor [V,C,H,W]
@@ -129,7 +137,7 @@ def main():
     Xtr, Ytr = to_chw(Xg[train_v]), to_chw(Ylog[train_v])
     Xva, Yva = to_chw(Xg[val_v]), to_chw(Ylog[val_v])
 
-    model = UNet(len(GBUF_COLS), base=args.base).to(dev)
+    model = UNet(GB, base=args.base).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     nparams = sum(p.numel() for p in model.parameters())
@@ -165,17 +173,16 @@ def main():
     results = {"model": "deferred_unet", "device": str(dev), "params": nparams,
                "train_seconds": train_secs, "epochs": args.epochs,
                "scene": meta.get("scene", "?"), "valViews": val_v,
-               "in_channels": len(GBUF_COLS), "held_out": m}
+               "in_channels": GB, "held_out": m}
     json.dump(results, open(os.path.join(args.out, "metrics.json"), "w"), indent=2)
     torch.save({"state_dict": model.state_dict(), "base": args.base,
-                "in_ch": len(GBUF_COLS)}, os.path.join(args.out, "model.pt"))
+                "in_ch": GB}, os.path.join(args.out, "model.pt"))
     np.savez(os.path.join(args.out, "standardize.npz"), mean=mean, std=std)
 
     # --- comparison figure for the first held-out view ---------------------
     try:
         from PIL import Image
-        alb = Y[val_v][0] * 0 + X[val_v][0][..., ALBEDO]   # raw albedo input
-        top = np.hstack([tonemap_u8(np.clip(alb, 0, 1)),    # albedo (a G-buffer input)
+        top = np.hstack([tonemap_u8(np.clip(alb_fig, 0, 1)),  # albedo (a G-buffer input)
                          tonemap_u8(pred[0]),               # U-Net prediction
                          tonemap_u8(ref[0])])               # path-traced reference
         err = np.abs(tonemap_u8(pred[0]).astype(int) - tonemap_u8(ref[0]).astype(int)).astype(np.uint8)
@@ -186,7 +193,7 @@ def main():
         print("PIL unavailable, skipping image:", e)
 
     print("\n============== DEFERRED SHADING (held-out views) ==============")
-    print(f"  scene={meta.get('scene','?')}  in-channels={len(GBUF_COLS)} (pos+normal+albedo+hit)")
+    print(f"  scene={meta.get('scene','?')}  in-channels={GB} (pos+normal+albedo+hit)")
     print(f"  U-Net  relMSE={m['relMSE']:.4f}  PSNR={m['psnr_tonemapped']:.2f} dB")
     print("===============================================================")
 

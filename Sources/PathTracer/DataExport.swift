@@ -183,3 +183,66 @@ func exportSequence(device: MTLDevice, baseScene: Scene, width: Int, height: Int
     try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]).write(to: metaURL)
     print("Sequence written to \(outDir)/  (\(frames) frames, \(width)x\(height), G-buffer \(GB)ch + motion + target)")
 }
+
+/// Sequence export for the *instanced/textured* path (Sponza). Same layout as
+/// `exportSequence`, but the G-buffer (incl. textured albedo) and converged sun+sky
+/// target come from an `InstancedRenderer`, so the network learns the real Sponza
+/// materials. `sceneName` is recorded for the Python side.
+func exportSequenceInstanced(renderer r: InstancedRenderer, sceneName: String,
+                             width: Int, height: Int, frames: Int, targetSpp: Int,
+                             bounces: Int, arcDeg: Float, outDir: String) throws {
+    let GB = 10
+    try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+    let (center, invExtent) = r.instNorm()
+    let cam0 = r.uniforms.camera
+    let baseOff = cam0.position - center
+    let radius = max(simd_length(baseOff), 1e-3)
+    let baseYaw = atan2(baseOff.x, baseOff.z)
+    let pitch = asin(max(-0.999, min(0.999, baseOff.y / radius)))
+    let fovY = 2 * atan(cam0.tanHalfFovY) * 180 / .pi
+    let aspect = Float(width) / Float(height)
+
+    var X = [Float](); var MV = [Float](); var Y = [Float]()
+    var prevCam: Camera?
+    for f in 0..<frames {
+        let t = frames > 1 ? Float(f) / Float(frames - 1) : 0
+        let yaw = baseYaw + radians(arcDeg) * (t - 0.5)
+        let eye = center + radius * SIMD3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw))
+        let cam = Camera.lookAt(eye: eye, target: center, fovYDeg: fovY, aspect: aspect)
+        r.uniforms.camera = cam
+
+        let target = r.renderReferenceLinear(spp: targetSpp, bounces: bounces)
+        let g = r.captureGBuffer()                                  // 10ch, RAW position in 7..9
+        for py in 0..<height {
+            for px in 0..<width {
+                let i = py * width + px, b = i * GB
+                let hit = g[b]
+                let rawPos = SIMD3(g[b + 7], g[b + 8], g[b + 9])
+                let p = (rawPos - center) * invExtent
+                X.append(contentsOf: [g[b], g[b+1], g[b+2], g[b+3], g[b+4], g[b+5], g[b+6], p.x, p.y, p.z])
+                var mv = SIMD2<Float>(0, 0)
+                if let pc = prevCam, hit > 0.5 {
+                    let prev = projectPixel(pc, rawPos, width, height)
+                    mv = SIMD2(Float(px) + 0.5 - prev.x, Float(py) + 0.5 - prev.y)
+                }
+                MV.append(contentsOf: [mv.x, mv.y])
+                Y.append(contentsOf: [target[i].x, target[i].y, target[i].z])
+            }
+        }
+        print(String(format: "  seq frame %2d/%d  (yaw %+.1f°)", f + 1, frames, (yaw - baseYaw) * 180 / .pi))
+        prevCam = cam
+    }
+
+    func writeFloats(_ a: [Float], _ name: String) throws {
+        try a.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: outDir).appendingPathComponent(name)) }
+    }
+    try writeFloats(X, "Xseq.bin"); try writeFloats(MV, "MVseq.bin"); try writeFloats(Y, "Yseq.bin")
+    let meta: [String: Any] = [
+        "frames": frames, "width": width, "height": height, "gbuf": GB,
+        "arcDeg": arcDeg, "targetSpp": targetSpp, "bounces": bounces, "scene": sceneName,
+        "gbufLayout": ["hit", "normal.xyz", "albedo.xyz", "posScaled.xyz"],
+    ]
+    try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys])
+        .write(to: URL(fileURLWithPath: outDir).appendingPathComponent("meta.json"))
+    print("Instanced sequence written to \(outDir)/  (\(frames) frames, \(width)x\(height), textured G-buffer)")
+}

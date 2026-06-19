@@ -66,9 +66,75 @@ if ["insttest", "island", "moana", "sponza", "objscene"].contains(sceneName) {
         r.viewMode = args.int("view", 0)
         r.texturesEnabled = !args.has("notex")
 
+        if let nnPath = args.map["neural"] {
+            // Realtime in-Metal neural deferred shading: load the trained per-pixel
+            // MLP weights and shade entirely on the GPU (G-buffer → MLP → tonemap).
+            try r.loadNeuralWeights(path: nnPath)
+            r.texturesEnabled = true
+            r.uniforms.radianceClamp = args.float("clamp", 8)
+            if args.has("window") {
+                runWindowApp(r, bounces: bounces, exposure: args.float("exposure", 1.0))
+                exit(0)
+            }
+            r.renderNeuralHeadless()
+            let rgba = r.resolveRGBA8(exposure: args.float("exposure", 1.0))
+            let out = args.str("out", "render.png")
+            writePNG(rgba8: rgba, width: width, height: height, to: out)
+            let benchN = 40
+            let t0 = Date()
+            for _ in 0..<benchN { r.renderNeuralHeadless() }
+            let ms = Date().timeIntervalSince(t0) / Double(benchN) * 1000
+            print(String(format: "wrote %@  (realtime per-pixel neural shade: %.2f ms/frame, %.0f FPS @ %dx%d)",
+                         out, ms, 1000.0 / ms, width, height))
+            exit(0)
+        }
+
         if args.has("window") {
             r.uniforms.radianceClamp = args.float("clamp", 8)
             runWindowApp(r, bounces: bounces, exposure: args.float("exposure", 1.0))
+            exit(0)
+        }
+
+        if args.has("exportseq") {
+            // Textured G-buffer sequence export for neural deferred shading on Sponza.
+            r.texturesEnabled = !args.has("notex")
+            r.uniforms.radianceClamp = args.float("clamp", 8)
+            try exportSequenceInstanced(renderer: r, sceneName: sceneName, width: width, height: height,
+                                        frames: args.int("frames", 48), targetSpp: args.int("targetSpp", 128),
+                                        bounces: bounces, arcDeg: args.float("arcDeg", 60),
+                                        outDir: args.str("out", "research/data_seq"))
+            exit(0)
+        }
+
+        if args.has("gbufserver") {
+            // Resident textured G-buffer server for the interactive viewer (research/play.py).
+            r.texturesEnabled = !args.has("notex")
+            r.uniforms.radianceClamp = args.float("clamp", 8)
+            let (center, invExtent) = r.instNorm()
+            let cam0 = isc.camera
+            let fovY = 2 * atan(cam0.tanHalfFovY) * 180 / Float.pi
+            let asp = Float(width) / Float(height)
+            let e0 = cam0.position
+            let outPath = args.str("out", "/tmp/pt_gbuf.bin")
+            func emit(_ s: String) { FileHandle.standardOutput.write(Data((s + "\n").utf8)) }
+            emit("READY \(width) \(height) \(center.x) \(center.y) \(center.z) \(e0.x) \(e0.y) \(e0.z) \(fovY)")
+            while let line = readLine(strippingNewline: true) {
+                if line == "quit" { break }
+                let v = line.split(separator: ",").compactMap { Float($0) }
+                guard v.count >= 6 else { emit("OK"); continue }
+                let fov = v.count >= 7 ? v[6] : fovY
+                r.uniforms.camera = Camera.lookAt(eye: SIMD3(v[0], v[1], v[2]),
+                                                  target: SIMD3(v[3], v[4], v[5]), fovYDeg: fov, aspect: asp)
+                var g = r.captureGBuffer()
+                for i in 0..<(width * height) {                    // normalize RAW position -> posScaled
+                    let b = i * 10
+                    g[b + 7] = (g[b + 7] - center.x) * invExtent
+                    g[b + 8] = (g[b + 8] - center.y) * invExtent
+                    g[b + 9] = (g[b + 9] - center.z) * invExtent
+                }
+                try? g.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: outPath)) }
+                emit("OK")
+            }
             exit(0)
         }
 

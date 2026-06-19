@@ -145,6 +145,12 @@ final class InstancedRenderer {
     private let blasList: [MTLAccelerationStructure]
     private let tlas: MTLAccelerationStructure
     private let psPathtrace, psNormals, psResolve: MTLComputePipelineState
+    private let psExportGBuffer: MTLComputePipelineState
+    private var psNeuralShade: MTLComputePipelineState?
+    // Realtime neural shader weights (loaded from research/neural_shader.py export).
+    private var nnNorm, nnW1, nnB1, nnW2, nnB2, nnW3, nnB3, nnW4, nnB4: MTLBuffer?
+    private var gbufBuf: MTLBuffer?
+    var neuralShading = false
     private let accumBuf: MTLBuffer
     private let albedoTextures: [MTLTexture]      // exactly 32 (padded with a white dummy)
     var uniforms = IslandUniforms()
@@ -277,6 +283,8 @@ final class InstancedRenderer {
         psPathtrace = try pso("instPathtrace")
         psNormals = try pso("instNormals")
         psResolve = try pso("resolve")
+        psExportGBuffer = try pso("instExportGBuffer")
+        psNeuralShade = try pso("neuralShadeInst")
 
         accumBuf = device.makeBuffer(length: width * height * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared)!
 
@@ -339,6 +347,10 @@ final class InstancedRenderer {
     /// texture (used by the realtime window app). Caller commits/presents.
     func encodeRealtimeFrame(into cmd: MTLCommandBuffer, target: MTLTexture,
                              samplesPerFrame: Int, bounces: Int, exposure: Float) {
+        if neuralShading && nnNorm != nil {           // realtime in-Metal neural shading
+            encodeNeuralFrame(into: cmd, target: target, exposure: exposure)
+            return
+        }
         uniforms.maxBounces = UInt32(bounces)
         uniforms.samplesPerFrame = UInt32(samplesPerFrame)
         uniforms.frameIndex = frames
@@ -375,6 +387,162 @@ final class InstancedRenderer {
         rs.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: rw, height: rh, depth: 1))
         rs.endEncoding()
+    }
+
+    // MARK: Neural deferred shading (G-buffer source for Sponza / textured scenes)
+
+    /// Scene-position normalization (centre + inverse extent) matching SceneNorm,
+    /// so the instanced G-buffer's position channel lines up with training data.
+    func instNorm() -> (center: SIMD3<Float>, invExtent: Float) {
+        let (lo, hi) = scene.worldBounds()
+        let center = (lo + hi) * 0.5
+        let extent = simd_reduce_max(hi - lo)
+        return (center, extent > 0 ? 2.0 / extent : 1.0)
+    }
+
+    /// Mean linear radiance per pixel from the accumulation buffer.
+    func resolveLinear() -> [SIMD3<Float>] {
+        let ptr = accumBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: width * height)
+        return (0..<(width * height)).map { i in
+            let a = ptr[i]; let n = max(a.w, 1); return SIMD3(a.x, a.y, a.z) / n
+        }
+    }
+
+    /// Render a converged (beauty) reference and return mean linear radiance.
+    func renderReferenceLinear(spp: Int, bounces: Int) -> [SIMD3<Float>] {
+        let savedView = viewMode
+        viewMode = 0                                   // beauty (sun+sky GI), not an AOV
+        _ = render(spp: spp, bounces: bounces)
+        viewMode = savedView
+        return resolveLinear()
+    }
+
+    /// Capture the minimal deferred G-buffer (textured) for the current camera:
+    /// 10 floats/pixel — hit, shading normal(xyz), textured albedo(xyz), RAW world
+    /// position(xyz). Callers normalize the position via `instNorm()`.
+    func captureGBuffer() -> [Float] {
+        let gbuf = device.makeBuffer(length: width * height * 10 * MemoryLayout<Float>.stride,
+                                     options: .storageModeShared)!
+        uniforms.frameIndex = 0
+        uniforms.flags = frameFlags()                  // carries texturesEnabled (bit3)
+        let cb = queue.makeCommandBuffer()!
+        let e = cb.makeComputeCommandEncoder()!
+        e.setComputePipelineState(psExportGBuffer)
+        e.setBuffer(gbuf, offset: 0, index: 0)
+        e.setBytes(&uniforms, length: MemoryLayout<IslandUniforms>.stride, index: 1)
+        e.setBuffer(positionsBuf, offset: 0, index: 2)
+        e.setBuffer(normalsBuf, offset: 0, index: 3)
+        e.setBuffer(indicesBuf, offset: 0, index: 4)
+        e.setBuffer(instanceDataBuf, offset: 0, index: 5)
+        e.setBuffer(materialsBuf, offset: 0, index: 6)
+        e.setAccelerationStructure(tlas, bufferIndex: 7)
+        e.setBuffer(uvsBuf, offset: 0, index: 8)
+        e.setTextures(albedoTextures, range: 0..<32)
+        e.useResources(blasList, usage: .read)
+        let w = psExportGBuffer.threadExecutionWidth, h = max(1, psExportGBuffer.maxTotalThreadsPerThreadgroup / w)
+        e.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                          threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+        e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        let ptr = gbuf.contents().bindMemory(to: Float.self, capacity: width * height * 10)
+        return Array(UnsafeBufferPointer(start: ptr, count: width * height * 10))
+    }
+
+    /// Load the trained per-pixel shader weights (research/neural_shader.py export)
+    /// into GPU buffers and enable realtime neural shading. Layout in shader.bin:
+    /// mean(9), std(9), then [W,b] for layers 33→128, 128→128, 128→128, 128→3.
+    func loadNeuralWeights(path: String) throws {
+        let floats = try Data(contentsOf: URL(fileURLWithPath: path)).withUnsafeBytes {
+            Array($0.bindMemory(to: Float.self))
+        }
+        let expected = 18 + (64 * 33 + 64) + (64 * 64 + 64) * 2 + (3 * 64 + 3)
+        guard floats.count == expected else { throw Err.msg("shader.bin has \(floats.count) floats, expected \(expected)") }
+        var p = 0
+        // Weights as half precision in the constant cache (fast broadcast reads).
+        func takeHalf(_ n: Int) -> MTLBuffer {
+            let a = floats[p..<p + n].map { Float16($0) }; p += n
+            return Array(a).withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: n * 2, options: .storageModeShared)! }
+        }
+        // norm buffer = mean(9) ++ std(9) ++ scene centre(3) ++ invExtent(1), so the
+        // kernel can scene-normalize the raw G-buffer position to the training layout.
+        let (center, invExtent) = instNorm()
+        let normArr = Array(floats[0..<18]) + [center.x, center.y, center.z, invExtent]
+        nnNorm = device.makeBuffer(bytes: normArr, length: normArr.count * MemoryLayout<Float>.stride, options: .storageModeShared)
+        p = 18
+        nnW1 = takeHalf(64 * 33); nnB1 = takeHalf(64)
+        nnW2 = takeHalf(64 * 64); nnB2 = takeHalf(64)
+        nnW3 = takeHalf(64 * 64); nnB3 = takeHalf(64)
+        nnW4 = takeHalf(3 * 64); nnB4 = takeHalf(3)
+        neuralShading = true
+    }
+
+    private func dispatchSize(_ pso: MTLComputePipelineState, _ e: MTLComputeCommandEncoder) {
+        let w = pso.threadExecutionWidth, h = max(1, pso.maxTotalThreadsPerThreadgroup / w)
+        e.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                          threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+    }
+
+    /// Encode the two GPU passes that produce neural radiance into `accumBuf`:
+    /// textured G-buffer, then the per-pixel MLP shade. Shared by realtime + headless.
+    private func encodeGBufferAndShade(into cmd: MTLCommandBuffer) {
+        if gbufBuf == nil {
+            gbufBuf = device.makeBuffer(length: width * height * 10 * MemoryLayout<Float>.stride, options: .storageModeShared)
+        }
+        uniforms.frameIndex = frames
+        uniforms.flags = frameFlags()
+
+        let ge = cmd.makeComputeCommandEncoder()!          // 1) textured G-buffer
+        ge.setComputePipelineState(psExportGBuffer)
+        ge.setBuffer(gbufBuf!, offset: 0, index: 0)
+        ge.setBytes(&uniforms, length: MemoryLayout<IslandUniforms>.stride, index: 1)
+        ge.setBuffer(positionsBuf, offset: 0, index: 2)
+        ge.setBuffer(normalsBuf, offset: 0, index: 3)
+        ge.setBuffer(indicesBuf, offset: 0, index: 4)
+        ge.setBuffer(instanceDataBuf, offset: 0, index: 5)
+        ge.setBuffer(materialsBuf, offset: 0, index: 6)
+        ge.setAccelerationStructure(tlas, bufferIndex: 7)
+        ge.setBuffer(uvsBuf, offset: 0, index: 8)
+        ge.setTextures(albedoTextures, range: 0..<32)
+        ge.useResources(blasList, usage: .read)
+        dispatchSize(psExportGBuffer, ge)
+        ge.endEncoding()
+
+        let ne = cmd.makeComputeCommandEncoder()!          // 2) per-pixel neural shade
+        ne.setComputePipelineState(psNeuralShade!)
+        ne.setBuffer(accumBuf, offset: 0, index: 0)
+        ne.setBytes(&uniforms, length: MemoryLayout<IslandUniforms>.stride, index: 1)
+        ne.setBuffer(gbufBuf!, offset: 0, index: 2)
+        ne.setBuffer(nnNorm, offset: 0, index: 3)
+        ne.setBuffer(nnW1, offset: 0, index: 4); ne.setBuffer(nnB1, offset: 0, index: 5)
+        ne.setBuffer(nnW2, offset: 0, index: 6); ne.setBuffer(nnB2, offset: 0, index: 7)
+        ne.setBuffer(nnW3, offset: 0, index: 8); ne.setBuffer(nnB3, offset: 0, index: 9)
+        ne.setBuffer(nnW4, offset: 0, index: 10); ne.setBuffer(nnB4, offset: 0, index: 11)
+        dispatchSize(psNeuralShade!, ne)
+        ne.endEncoding()
+        frames += 1
+    }
+
+    /// Realtime neural frame: G-buffer → per-pixel MLP shade → tonemap, all on the
+    /// GPU (no path tracing, no CPU readback). Used by the interactive viewer.
+    func encodeNeuralFrame(into cmd: MTLCommandBuffer, target: MTLTexture, exposure: Float) {
+        encodeGBufferAndShade(into: cmd)
+        let rs = cmd.makeComputeCommandEncoder()!          // 3) tonemap resolve
+        rs.setComputePipelineState(psResolve)
+        rs.setTexture(target, index: 0)
+        rs.setBuffer(accumBuf, offset: 0, index: 0)
+        var size = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        rs.setBytes(&size, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
+        var e = exposure
+        rs.setBytes(&e, length: MemoryLayout<Float>.stride, index: 2)
+        dispatchSize(psResolve, rs)
+        rs.endEncoding()
+    }
+
+    /// Headless neural render into `accumBuf` (read out with `resolveRGBA8`).
+    func renderNeuralHeadless() {
+        frames = 0
+        let cmd = queue.makeCommandBuffer()!
+        encodeGBufferAndShade(into: cmd)
+        cmd.commit(); cmd.waitUntilCompleted()
     }
 
     func resolveRGBA8(exposure: Float = 1) -> [UInt8] {
