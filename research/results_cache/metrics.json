@@ -1,0 +1,44 @@
+{
+  "device": "mps",
+  "model": "cache",
+  "train_seconds": 88.65122294425964,
+  "params": 286979,
+  "epochs": 60,
+  "scene": "cornell",
+  "targetSpp": 512,
+  "valViews": [
+    14,
+    15
+  ],
+  "all_pixels": {
+    "label": "all pixels",
+    "pixels": 131072,
+    "one_spp": {
+      "relMSE": 0.6110044121742249,
+      "normMSE": 0.081285759806633,
+      "psnr_tonemapped": 14.07410479096837
+    },
+    "neural": {
+      "relMSE": 0.006084892898797989,
+      "normMSE": 0.032244399189949036,
+      "psnr_tonemapped": 30.772177155432843
+    },
+    "effective_spp_amplification": 2.5209264817677464
+  },
+  "hit_pixels": {
+    "label": "shaded (hit) pixels",
+    "pixels": 112720,
+    "one_spp": {
+      "relMSE": 0.7098597288131714,
+      "normMSE": 0.08155737817287445,
+      "psnr_tonemapped": 13.436753658210163
+    },
+    "neural": {
+      "relMSE": 0.006460309959948063,
+      "normMSE": 0.03233706206083298,
+      "psnr_tonemapped": 31.018773663449792
+    },
+    "effective_spp_amplification": 2.522102286826412
+  },
+  "final_train_loss": 0.0015087362096112753
+}

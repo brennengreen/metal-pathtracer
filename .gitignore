@@ -1,0 +1,21 @@
+# Build artifacts
+.build/
+*.o
+*.swiftmodule
+
+# Large generated research data (regenerate with --export / --samplestack)
+research/data/
+research/data_*/
+research/stack/
+research/results/*.pt
+research/results*/*.pt
+
+# Downloaded test assets (regenerate via research/download_*.sh + the OBJ curl loop)
+assets/
+
+# Rendered scratch images at repo root
+/render.png
+/cornell.png
+/showcase.png
+/normals.png
+.DS_Store
