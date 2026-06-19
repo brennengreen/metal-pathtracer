@@ -973,12 +973,12 @@ kernel void exportFeatures(device float4*                   accum       [[buffer
 }
 
 //===----------------------------------------------------------------------===//
-// INSTANCED RENDERING (BLAS/TLAS) — the engine for Moana-scale scenes.
+// INSTANCED RENDERING (BLAS/TLAS) — the engine for massively instanced scenes.
 //
 // A two-level acceleration structure (per-mesh BLAS + a top-level instance
 // acceleration structure) lets a handful of unique meshes be replicated into
 // millions of instances (billions of effective triangles) with a tiny memory
-// footprint — exactly the technique the Disney Moana Island Scene requires.
+// footprint — the same engine that drives the textured Sponza scene.
 //===----------------------------------------------------------------------===//
 using namespace raytracing;
 
@@ -993,7 +993,7 @@ struct InstanceData {
     uint   _pad1;
 };
 
-// Sun + sky + camera uniforms for outdoor (island) rendering.
+// Sun + sky + camera uniforms for outdoor instanced rendering (e.g. Sponza).
 struct IslandUniforms {
     Camera camera;
     uint2  imageSize;

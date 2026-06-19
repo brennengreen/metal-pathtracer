@@ -35,11 +35,10 @@ color bleeding, soft shadows.*
   Fresnel‑Schlick, height‑correlated Smith masking, Lambert diffuse, VNDF importance
   sampling (Heitz 2018), **next‑event estimation + multiple importance sampling** (power
   heuristic), Russian‑roulette termination, thin‑lens depth of field, ACES tonemapping.
-* **Moana‑scale instancing.** A two‑level acceleration structure (BLAS‑per‑mesh + a
-  top‑level `MTLInstanceAccelerationStructure`) replicates a handful of unique meshes into
-  **millions of instances / billions of effective triangles** — the technique the Disney
-  Moana Island Scene is built on. A real **Moana data‑set loader** reads Disney's element
-  JSON directly (see [`research/MOANA.md`](research/MOANA.md)).
+* **Hardware instancing.** A two‑level acceleration structure (BLAS‑per‑mesh + a top‑level
+  `MTLInstanceAccelerationStructure`) replicates a handful of unique meshes across many
+  instances with a tiny memory footprint — the same engine that loads Crytek Sponza as
+  per‑material instances and that the synthetic `insttest` scene stresses.
 * **Real textured scenes.** A UV‑preserving **OBJ + MTL loader** (`OBJScene.swift`) with an
   ImageIO **texture pipeline** (sRGB `MTLTexture` + mips, 32‑slot sampler array) renders the
   canonical **Crytek Sponza** GI scene — 262 k triangles, 25 materials, 43 textures — fully lit.
@@ -82,23 +81,15 @@ research/download_sponza.sh                     # obj + mtl + 43 textures → as
 # Bidirectional path tracing (camera + light subpaths, MIS over all strategies)
 ./.build/release/pathtracer --scene cornell --integrator bdpt --width 800 --height 800 --spp 256 --out cornell_bdpt.png
 
-# Moana-scale procedural island (instanced palms / ferns / rocks on a terrain + ocean)
-./.build/release/pathtracer --scene island --width 1280 --height 720 --spp 192 --bounces 5 --clamp 6 --out island.png
+# Hardware-instancing sanity scene (two-level BLAS/TLAS, instanced cubes under sun + sky)
+./.build/release/pathtracer --scene insttest --width 1000 --height 640 --spp 128 --out insttest.png
 
-# Push the instancer: density 700 ≈ 13 M instances ≈ 1.0 billion effective triangles
-./.build/release/pathtracer --scene island --density 700 --kernel normals --width 640 --height 360 --out scale.png
-
-# Render the REAL Disney Moana Island Scene base package (see research/MOANA.md)
-research/download_moana.sh base ./moana
-./.build/release/pathtracer --scene moana --moana ./moana/island --maxInst 4000000 --spp 64 --bounces 6 --clamp 8 --out moana.png
-
-# Realtime interactive viewer with live feature (AOV) toggles — works with sponza / island / moana too
+# Realtime interactive viewer with live feature (AOV) toggles — works with sponza too
 ./.build/release/pathtracer --window --scene sponza --width 1000 --height 640
 ```
 
-CLI flags: `--scene {cornell|showcase|island|insttest|moana|sponza}` · `--integrator {pt|bdpt}`
+CLI flags: `--scene {cornell|showcase|insttest|sponza}` · `--integrator {pt|bdpt}`
 · `--model <file.obj>` · `--modelMat <preset>` · `--yaw <deg>` · `--fit <units>`
-· `--density <n>` (island) · `--moana <dir>` · `--maxInst <n>` · `--moanaTranspose`
 · `--obj <file.obj>` · `--extent <units>` (sponza/objscene)
 · `--width/--height` · `--spp` · `--bounces` · `--clamp <luminance>` (0 = unbiased)
 · `--exposure` · `--view {0..7}` (instanced AOV) / `{0..9}` (Cornell ML‑feature channel) · `--notex` · `--kernel {pathtrace|normals}` · `--window` · `--out`.
@@ -165,7 +156,7 @@ other textured OBJ/MTL scene through the same path.
 
 `--window` opens a progressive, real‑time path‑traced viewer that re‑accumulates samples every
 frame and resets cleanly whenever the image changes (camera, view mode, textures, bounces,
-exposure). It works for any instanced scene — `sponza`, `island`, `moana` — not just Cornell:
+exposure). It works for any instanced scene — `sponza`, `insttest`, or any `--obj` — not just Cornell:
 
 ```bash
 ./.build/release/pathtracer --window --scene sponza --width 1000 --height 640 --bounces 4
@@ -236,74 +227,15 @@ TGA's own alpha channel** (`vase_plant`, `chain_texture`, `sponza_thorn_diff`), 
 *Tight crop on an atrium plant: crisp per‑leaf silhouettes with the background visible through
 the gaps — not solid quads. `SPONZA_CAM="-150,150,70,-407,100,197"` frames this cluster.*
 
-### The Disney *Moana Island* scene — the instancing path
-
-The Moana Island Scene is the canonical production instancing stress test, and this renderer
-now targets it directly through hardware instancing.
-
-![Procedural Moana-scale island](docs/island_hero.png)
-
-*1280×720, 192 spp — a procedural Motunui‑style island: a banded terrain (beach / jungle /
-volcanic rock) + ocean, with **18 k instanced** palms, ferns and rocks lit by an analytic sun
-and sky. Same BLAS/TLAS engine the real data needs.*
-
-**Massive instancing, measured on an Apple M4 Air.** A handful of unique meshes are
-replicated through a two‑level acceleration structure; `--density` scales the instance count:
-
-| `--density` | instances | effective triangles | resident memory | primary‑visibility |
-|---:|---:|---:|---:|---:|
-| 1   | 18 k   | 1.6 M   | — | 9 ms/frame |
-| 25  | 463 k  | 37 M    | — | (build dominated) |
-| 100 | 1.85 M | 148 M   | — | 20 ms/frame |
-| 300 | 5.55 M | 444 M   | 1.9 GB | 69 ms/frame |
-| **700** | **13.0 M** | **1.04 billion** | **4.0 GB** | 142 ms/frame |
-
-So a laptop GPU resolves a **billion‑triangle** island from ~13 M instances of 16 unique
-meshes in ~4 GB — exactly the trade the Moana data set was designed to exercise.
-
-![Denser instanced island](docs/island_lush.png)
-
-*The same scene at `--density 3` (≈55 k instances, 4.5 M effective triangles): a denser palm
-canopy climbing the slopes to the volcanic peak — turn `--density` up for the scale numbers
-above.*
-
-**The real data set.** A loader (`MoanaLoader.swift`) parses Disney's *base package* element
-JSON directly — `transformMatrix`, `geomObjFile`, `instancedCopies` and the
-`instancedPrimitiveJsonFiles` archives that scatter the millions of palms/rocks — and feeds
-them into the same instancing engine. The data is **45 GB download / 93 GB unpacked**, so it
-is fetched on demand rather than bundled:
-
-```bash
-research/download_moana.sh base ./moana            # disk‑space‑guarded, resumable
-./.build/release/pathtracer --scene moana --moana ./moana/island --maxInst 4000000 --out moana.png
-```
-
-Because that 93 GB won't fit on every machine, the loader is validated against a **faithful
-miniature** in the identical directory/JSON layout (`research/make_moana_mini.py`), proving
-the element parsing, archive parsing, column‑major matrix convention and `instancedCopies`
-path all round‑trip through the real code:
-
-![Moana loader validation](docs/moana_loader_validation.png)
-
-*662 instances (520 plant + 140 rock archive instances + ground + a whole‑element copy) placed
-from real‑format Moana JSON — every instance upright with correct per‑instance scale/rotation.*
-
-What the loader does **not** do (out of scope for a geometry/instancing renderer): Ptex
-per‑face textures, subdivision‑surface tessellation, and curve/hair primitives. Materials are
-assigned by an element‑name heuristic. See [`research/MOANA.md`](research/MOANA.md) for the
-full format mapping, flags and workflow.
-
 ## 5. Architecture
 
 ```
 Sources/PathTracer/
   Resources/pathtrace.metal   MSL kernels: HW‑RT PT + BDPT integrators, NEE+MIS, instanced
-                              (BLAS/TLAS) island integrator, normals, feature export, resolve
+                              (BLAS/TLAS) integrator, normals, feature export, resolve
   Renderer.swift              Metal device, scene buffers, accel build, pipelines, accumulation
   Scene.swift                 Cornell box + PBR material‑showcase scenes, geometry builders
   Instancing.swift            BLAS‑per‑mesh + top‑level instance accel structure, instanced renderer
-  IslandScene.swift           procedural Moana‑scale island (banded terrain, ocean, palms/ferns/rocks)
-  MoanaLoader.swift           real Disney Moana base‑package element/archive JSON loader
   OBJScene.swift              UV‑preserving OBJ+MTL loader → per‑material instances (Sponza)
   TextureLoader.swift         ImageIO → sRGB MTLTexture + mips for the 32‑slot sampler array
   OBJLoader.swift             fast Wavefront OBJ loader (multi‑million‑triangle meshes)
@@ -314,7 +246,6 @@ Sources/PathTracer/
   Util.swift / PNGWriter.swift  deterministic RNG, camera (de)serialization, PNG output
 research/
   model.py  train.py  eval_amplify.py   neural amplifier: model, training, measurement
-  make_moana_mini.py  download_moana.sh  MOANA.md   Moana data: validation fixture, fetch, docs
   download_sponza.sh                                Crytek Sponza: obj + mtl + textures fetch
 ```
 
@@ -392,6 +323,5 @@ See **`research/REPORT.md`** for the full experiment write‑up, metrics, and ho
 * T. Müller et al. — *Real‑time Neural Radiance Caching for Path Tracing*, SIGGRAPH 2021.
 * E. Heitz — *Sampling the GGX Distribution of Visible Normals*, JCGT 2018.
 * E. Veach — *Robust Monte Carlo Methods for Light Transport Simulation* (BDPT, MIS), 1997.
-* Walt Disney Animation Studios — *Moana Island Scene* data set (instancing stress test).
 * Cornell Box reference geometry (Cornell Program of Computer Graphics).
 * Apple — *Metal*, *Accelerating ray tracing using Metal* (instance acceleration structures).

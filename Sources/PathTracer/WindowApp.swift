@@ -7,7 +7,7 @@ import Foundation
 /// A renderer that can drive the realtime viewer: progressive accumulation into
 /// a drawable, an orbit camera, and feature (AOV) view-mode toggles. Both the
 /// classic `Renderer` (Cornell/showcase) and the `InstancedRenderer`
-/// (Sponza/island/Moana) conform, so one viewer serves every scene.
+/// (Sponza / textured OBJ scenes) conform, so one viewer serves every scene.
 protocol RealtimeBackend: AnyObject {
     var device: MTLDevice { get }
     var queue: MTLCommandQueue { get }

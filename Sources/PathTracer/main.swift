@@ -42,21 +42,16 @@ let bounces = args.int("bounces", 8)
 let sceneName = args.str("scene", "cornell")
 let aspect = Float(width) / Float(height)
 
-// Instanced (BLAS/TLAS) path — Moana-scale scenes, the instancing test, and full OBJ scenes.
-if ["insttest", "island", "moana", "sponza", "objscene"].contains(sceneName) {
+// Instanced (BLAS/TLAS) path — the instancing stress test and full textured OBJ scenes (Sponza).
+if ["insttest", "sponza", "objscene"].contains(sceneName) {
     do {
         let isc: InstancedScene
         if sceneName == "insttest" {
             isc = InstancedScene.test(aspect: aspect)
-        } else if sceneName == "moana", let dir = args.map["moana"] ?? args.map["data"] {
-            isc = try MoanaLoader.load(dir: dir, aspect: aspect, maxInstances: args.int("maxInst", 0))
-        } else if sceneName == "sponza" || sceneName == "objscene" {
+        } else {
             let objPath = args.map["obj"] ?? args.map["model"] ?? "assets/sponza/sponza.obj"
             isc = try loadInstancedOBJScene(objPath: objPath, aspect: aspect,
                                             targetExtent: args.float("extent", 1200))
-        } else {
-            isc = IslandScene.build(aspect: aspect, density: args.int("density", 1),
-                                    seed: UInt64(args.int("seed", 1)))
         }
         print("Metal PBR Path Tracer — \(device.name), INSTANCED (BLAS/TLAS)")
         let effTris = isc.effectiveTriangles
