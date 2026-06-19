@@ -1,5 +1,6 @@
 import Metal
 import Foundation
+import simd
 
 // Minimal argument parsing: --key value  and  --flag.
 struct Args {
@@ -127,6 +128,52 @@ do {
                           targetSpp: args.int("targetSpp", 512), bounces: bounces,
                           views: args.int("views", 12), outDir: outDir,
                           clamp: args.float("clamp", 8))
+        exit(0)
+    }
+
+    if args.has("exportseq") {
+        // Temporally-coherent sequence export for neural deferred shading (Stage 2).
+        try exportSequence(device: device, baseScene: scene, width: width, height: height,
+                           frames: args.int("frames", 48), targetSpp: args.int("targetSpp", 128),
+                           bounces: bounces, clamp: args.float("clamp", 8),
+                           arcDeg: args.float("arcDeg", 100), outDir: args.str("out", "research/data_seq"))
+        exit(0)
+    }
+
+    if args.has("gbufserver") {
+        // Persistent G-buffer server for the interactive neural viewer (research/play.py):
+        // stays resident (one accel build), reads a camera per line on stdin, runs a single
+        // primary-ray pass, and writes the minimal 10-channel deferred G-buffer to `--out`.
+        let r = try Renderer(device: device, scene: scene, width: width, height: height)
+        r.uniforms.radianceClamp = args.float("clamp", 8)
+        let norm = SceneNorm(scene)
+        let center = norm.center
+        let cam0 = scene.camera
+        let fovY = 2 * atan(cam0.tanHalfFovY) * 180 / Float.pi
+        let aspect = Float(width) / Float(height)
+        let outPath = args.str("out", "/tmp/pt_gbuf.bin")
+        func emit(_ s: String) { FileHandle.standardOutput.write(Data((s + "\n").utf8)) }
+        // Handshake: image size, scene centre, initial eye, vertical FoV.
+        let e0 = cam0.position
+        emit("READY \(width) \(height) \(center.x) \(center.y) \(center.z) \(e0.x) \(e0.y) \(e0.z) \(fovY)")
+        while let line = readLine(strippingNewline: true) {
+            if line == "quit" { break }
+            let v = line.split(separator: ",").compactMap { Float($0) }
+            guard v.count >= 6 else { emit("OK"); continue }
+            let fov = v.count >= 7 ? v[6] : fovY
+            r.uniforms.camera = Camera.lookAt(eye: SIMD3(v[0], v[1], v[2]),
+                                              target: SIMD3(v[3], v[4], v[5]),
+                                              fovYDeg: fov, aspect: aspect)
+            let feats = r.captureFeatures(bounces: bounces)
+            var buf = [Float](); buf.reserveCapacity(width * height * 10)
+            for ft in feats {
+                let p = (ft.hitPos - center) * norm.invExtent
+                buf.append(contentsOf: [ft.hit, ft.normal.x, ft.normal.y, ft.normal.z,
+                                        ft.baseColor.x, ft.baseColor.y, ft.baseColor.z, p.x, p.y, p.z])
+            }
+            try? buf.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: outPath)) }
+            emit("OK")
+        }
         exit(0)
     }
 
