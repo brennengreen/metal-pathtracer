@@ -1,0 +1,17 @@
+{
+  "model": "deferred_unet",
+  "device": "mps",
+  "params": 844515,
+  "train_seconds": 710.433317899704,
+  "epochs": 5000,
+  "scene": "showcase",
+  "valViews": [
+    30,
+    31
+  ],
+  "in_channels": 10,
+  "held_out": {
+    "relMSE": 0.027538755908608437,
+    "psnr_tonemapped": 32.33402602618173
+  }
+}
