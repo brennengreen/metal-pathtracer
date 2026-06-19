@@ -1,26 +1,38 @@
-# Metal Realtime PBR Path Tracer + Neural Ray Amplification
+# Metal Realtime PBR Path Tracer + Neural Deferred Shading
 
 A from-scratch, **hardware‑accelerated path tracer written entirely on Apple Metal**,
 with a physically based (PBR) shading model in the style of PBRT / OpenMoonRay — plus
-a research probe into a concrete hypothesis:
+a research probe into **neural deferred shading**:
 
-> **Can an inference model predict the additional samples around a single cast ray —
-> so we physically trace *one* ray per pixel but obtain the radiance of *many*?**
+> **Cast only primary rays, keep the cheap deferred G‑buffer a rasteriser already has
+> (position · shading normal · albedo), and let a small neural network synthesise the
+> fully shaded, globally‑illuminated image — at frame rate, entirely inside Metal.**
 
-Short answer from this repo: **yes, ~68×** on a held‑out view of the Cornell box (directly
-measured against the real Monte‑Carlo convergence curve, no `1/√N` assumption), turning a
-13.4 dB single‑sample image into a 28.1 dB one.
+Short answer from this repo: **yes**. A ~11 k‑parameter per‑pixel MLP, compiled into a
+Metal compute kernel, reconstructs the Crytek Sponza atrium with full global illumination
+from **one primary ray per pixel** at **64 FPS (15.6 ms/frame, 1000×640, Apple M4)** —
+**27.0 dB** on held‑out camera frames, with no path‑traced bounces at render time.
 
-![Cornell box path traced on Metal](docs/cornell_hero.png)
+![Sponza shaded in realtime by an in‑Metal neural network](docs/sponza_neural.png)
 
-*800×800, 1024 spp, hardware ray tracing on an Apple M4 (5.6 s): global illumination,
-color bleeding, soft shadows.*
+*1000×640 — **one primary ray per pixel + a neural shader running entirely on the GPU**:
+the colonnade, coloured banners with gold filigree, plants and contact shadows are all
+synthesised by the MLP from a position/normal/albedo G‑buffer at 64 FPS.*
+
+This sits alongside an earlier probe — a **neural radiance amplifier** that turns one cast
+ray into **≈68 path‑traced samples** on a held‑out Cornell view (directly measured against
+the real Monte‑Carlo convergence curve, no `1/√N` assumption; 13.4 → 28.1 dB):
 
 | 1 spp (one cast ray) | neural amplifier (one cast ray + inference) | 512 spp reference |
 |:--:|:--:|:--:|
 | ![](docs/cornell_1spp.png) | ![](docs/cornell_neural.png) | ![](docs/cornell_ref.png) |
 
-*(See `research/results/comparison.png` and `research/results/convergence.png`.)*
+Both probes are trained and measured against references from the path tracer itself:
+
+![Cornell box path traced on Metal](docs/cornell_hero.png)
+
+*800×800, 1024 spp, hardware ray tracing on an Apple M4 (5.6 s): global illumination,
+color bleeding, soft shadows. (See also `research/results/convergence.png`.)*
 
 ---
 
@@ -47,8 +59,10 @@ color bleeding, soft shadows.*
 * **No Xcode required.** The Metal shaders are **compiled at runtime** from source
   (`MTLDevice.makeLibrary(source:)`), so the whole thing builds and runs with only the
   Swift toolchain in the **Command Line Tools**.
-* A **neural ray‑amplifier** research pipeline (Metal data export → PyTorch model →
-  rigorous effective‑sample measurement).
+* **Neural deferred shading** end‑to‑end: a Metal G‑buffer / motion‑vector sequence
+  exporter → PyTorch training (per‑pixel MLP, screen‑space U‑Net, temporal model) → a
+  trained MLP **compiled back into a Metal kernel** for realtime in‑loop inference; plus an
+  earlier **neural radiance amplifier** with rigorous effective‑sample measurement.
 
 ## 2. Requirements
 
@@ -182,7 +196,7 @@ bounce count, exposure and accumulated spp.
 #### ML‑pipeline diagnostics — *see what the neural amplifier sees*
 
 For the **Cornell / showcase** scenes (the classic `Renderer`, the one the neural
-ray‑amplifier trains on, §5) the same viewer decomposes the frame into the exact channels of
+ray‑amplifier trains on, §6) the same viewer decomposes the frame into the exact channels of
 the **21‑dim feature vector** the network ingests (`exportFeatures` → `research/model.py`), so
 you can inspect the model's inputs live for any camera and flip between the cheap input and the
 converging reference:
@@ -232,21 +246,27 @@ the gaps — not solid quads. `SPONZA_CAM="-150,150,70,-407,100,197"` frames thi
 ```
 Sources/PathTracer/
   Resources/pathtrace.metal   MSL kernels: HW‑RT PT + BDPT integrators, NEE+MIS, instanced
-                              (BLAS/TLAS) integrator, normals, feature export, resolve
+                              (BLAS/TLAS) integrator, G‑buffer + in‑Metal neural shader,
+                              normals, feature export, resolve
   Renderer.swift              Metal device, scene buffers, accel build, pipelines, accumulation
   Scene.swift                 Cornell box + PBR material‑showcase scenes, geometry builders
-  Instancing.swift            BLAS‑per‑mesh + top‑level instance accel structure, instanced renderer
+  Instancing.swift            BLAS‑per‑mesh + instance accel structure, instanced renderer,
+                              G‑buffer capture + in‑Metal neural shader (loadNeuralWeights)
   OBJScene.swift              UV‑preserving OBJ+MTL loader → per‑material instances (Sponza)
   TextureLoader.swift         ImageIO → sRGB MTLTexture + mips for the 32‑slot sampler array
   OBJLoader.swift             fast Wavefront OBJ loader (multi‑million‑triangle meshes)
   MathTypes.swift             host mirrors of the GPU structs, camera, tonemapping
   WindowApp.swift             realtime MTKView app + orbit camera
-  DataExport.swift            multi‑view training‑data export (research)
+  DataExport.swift            multi‑view + motion‑vector sequence training‑data export (research)
   SampleStack.swift           held‑out Monte‑Carlo stack for effective‑spp measurement
   Util.swift / PNGWriter.swift  deterministic RNG, camera (de)serialization, PNG output
 research/
-  model.py  train.py  eval_amplify.py   neural amplifier: model, training, measurement
-  download_sponza.sh                                Crytek Sponza: obj + mtl + textures fetch
+  deferred.py                 neural deferred shading: screen‑space U‑Net (G‑buffer → beauty)
+  neural_shader.py            per‑pixel MLP → shader.bin for the realtime in‑Metal kernel
+  temporal.py                 Stage 2: temporal motion‑vector reprojection (vs no‑history ablation)
+  play.py                     interactive U‑Net viewer driving `pathtracer --gbufserver`
+  model.py train.py eval_amplify.py   neural radiance amplifier: model, training, measurement
+  download_sponza.sh          Crytek Sponza: obj + mtl + textures fetch
 ```
 
 Data flow each frame: `pathtrace` kernel casts camera rays → traverses the acceleration
@@ -254,28 +274,106 @@ structure → evaluates the PBR BSDF with NEE+MIS → adds the sample into a `fl
 accumulation buffer; `resolve` tonemaps `accum/​sampleCount` into the drawable (realtime)
 or the CPU tonemaps it to a PNG (headless).
 
-## 5. The research hypothesis
+## 6. The research: neural deferred shading
 
-**Framing.** Path tracing is expensive because each pixel needs *many* sample paths to
-beat Monte‑Carlo noise. The hypothesis asks whether a learned model can supply the
-*rest of the samples* from a single physically cast ray. We implement this as a per‑scene
-**neural radiance amplifier** (in the spirit of Müller et al., *Real‑time Neural Radiance
-Caching for Path Tracing*, 2021): for every pixel the Metal tracer exports the **one cast
-ray’s** first‑hit G‑buffer (position, normal, view & bounce directions, base color,
-metallic, roughness) **plus that single ray’s 1‑spp radiance**, and a small MLP
-(288 k params) regresses the **converged multi‑sample radiance**. It is trained on a set
-of camera views and evaluated on **held‑out** views it never saw.
+**The hypothesis.** Path tracing is expensive because every pixel needs *many* sample paths
+to beat Monte‑Carlo noise. But a renderer can produce a **deferred G‑buffer** — per‑pixel hit
+position, shading normal and albedo — from a *single* primary ray, almost for free. Can a
+small neural network take that minimal G‑buffer and synthesise the **fully shaded,
+globally‑illuminated** image the path tracer would have produced with thousands of bounces?
 
-**Result (held‑out Cornell views).**
+This repo answers yes, and pushes it all the way onto the GPU: the trained network is
+**compiled into a Metal compute kernel** and runs inside the render loop, so the renderer
+casts one primary ray per pixel and the *shading* — direct light, sky, soft shadows, colour
+bleed — comes entirely from inference. Every dataset is exported by the tracer itself, so
+targets are real path‑traced references and **"held‑out" always means camera views the
+network never saw**.
+
+### Realtime, in‑Metal: a per‑pixel neural shader
+
+The realtime path is a deliberately tiny **per‑pixel MLP** (`research/neural_shader.py`): it
+maps one hit's `(shading normal, textured albedo, scene‑normalised position)` — 9 raw numbers,
+with the position lifted by a 4‑band Fourier encoding to 33 inputs — through
+`33 → 64 → 64 → 64 → 3` GELU layers to log‑radiance. About **11 k parameters**. Because it is
+per‑pixel (no convolution, no history) it ports directly to a Metal kernel (`neuralShadeInst`,
+one thread per pixel); training writes `shader.bin` (standardisation stats + weights), which
+the Swift loader reads straight into `MTLBuffer`s.
+
+On held‑out frames of the **Sponza** orbit it reconstructs the lit atrium at **27.0 dB** — and,
+the point of the exercise, it runs **on the GPU at 64 FPS (15.6 ms/frame @ 1000×640, Apple M4)**:
+
+![Per-pixel neural shader vs path-traced reference on Sponza](research/results_neural/comparison.png)
+
+*Left: the in‑Metal MLP shading a held‑out Sponza frame from its G‑buffer alone. Right: the
+path‑traced reference. (`research/results_neural/comparison.png`.)*
+
+```bash
+# 1) export a textured G-buffer + converged-target sequence along a camera orbit
+./.build/release/pathtracer --exportseq --scene sponza --width 480 --height 300 \
+      --frames 48 --targetSpp 128 --bounces 6 --clamp 8 --out research/data_sponza
+
+# 2) train the per-pixel MLP and bake the Metal weights (research/results_neural/shader.bin)
+python3 research/neural_shader.py --data research/data_sponza --out research/results_neural
+
+# 3) shade Sponza in realtime, entirely in Metal — interactive window, or a headless PNG + FPS
+./.build/release/pathtracer --neural research/results_neural/shader.bin --scene sponza --window
+./.build/release/pathtracer --neural research/results_neural/shader.bin --scene sponza \
+      --width 1000 --height 640 --out docs/sponza_neural.png
+```
+
+### Stage 1 — a screen‑space U‑Net (spatial context)
+
+A per‑pixel MLP can only see one hit. `research/deferred.py` trains the convolutional
+counterpart: a compact **U‑Net** (3 down/up levels with skips, GroupNorm + GELU, ~**845 k
+params**) that reads the 10‑channel screen‑space G‑buffer `(hit · normal · albedo · position)`
+and regresses log‑radiance, so it can exploit spatial neighbourhoods — the prerequisite for the
+temporal loop below. On held‑out **showcase** views it reaches **32.3 dB** (relative MSE 0.028):
+
+![Deferred U-Net: albedo input, prediction, reference, error](research/results_deferred/comparison.png)
+
+*`[ albedo (a G‑buffer input) | U‑Net prediction | path‑traced reference ]`, with the error
+row beneath. (`research/results_deferred/comparison.png`.)*
+
+```bash
+# multi-view dataset (21-dim features; the U-Net consumes the G-buffer subset)
+./.build/release/pathtracer --export --scene showcase --width 400 --height 400 \
+      --views 32 --targetSpp 512 --out research/data_showcase
+python3 research/deferred.py --data research/data_showcase --out research/results_deferred
+
+# interactive: orbit while the U-Net (PyTorch/MPS) shades the G-buffer streamed live from Metal
+python3 research/play.py        # drives `pathtracer --gbufserver` under the hood
+```
+
+### Stage 2 — temporal stability via motion vectors
+
+Shading each frame independently shimmers under camera motion. `research/temporal.py` feeds the
+network the **previous output reprojected by per‑pixel motion vectors** (a backward warp) and
+lets it blend that history with the current G‑buffer — the reproject‑and‑accumulate trick TAA
+and temporal denoisers use. The exporter writes the motion vectors alongside the G‑buffer
+(`--exportseq` → `Xseq` / `MVseq` / `Yseq`), and we score both PSNR and a **motion‑compensated
+flicker** metric on a held‑out arc, against a no‑history ablation of the *same* network:
+
+```bash
+./.build/release/pathtracer --exportseq --scene sponza --frames 64 --out research/data_seq
+python3 research/temporal.py --data research/data_seq --out research/results_temporal
+```
+
+### Earlier probe — the neural radiance amplifier (Cornell)
+
+The project started from the inverse question: instead of replacing shading, **amplify
+samples**. For every pixel the tracer exports the one cast ray's first‑hit G‑buffer (position,
+normal, view & bounce directions, base color, metallic, roughness) **plus that single ray's
+1‑spp radiance**, and a small MLP (288 k params) regresses the converged multi‑sample radiance
+(`research/model.py`, in the spirit of Müller et al., *Neural Radiance Caching*, 2021):
 
 | metric (shaded pixels) | 1 spp (one cast ray) | neural (one cast ray + inference) |
 |---|--:|--:|
 | relative MSE            | 0.710 | **0.0102** |
 | tonemapped PSNR         | 13.4 dB | **28.1 dB** (+14.6 dB) |
 
-**Directly measured effective samples.** Rather than assume `error ∝ 1/√N`, we render the
-held‑out view as **256 independent 1‑spp images** and average prefixes to obtain the *true*
-path‑tracing convergence curve `relMSE(K)`, then find where it crosses the neural error:
+Rather than assume `error ∝ 1/√N`, the held‑out view is rendered as **256 independent 1‑spp
+images** and prefix‑averaged to obtain the *true* convergence curve `relMSE(K)`, then we find
+where it crosses the neural error:
 
 ```
 1 spp path tracing    relMSE = 0.687
@@ -284,40 +382,35 @@ neural (1 cast ray)   relMSE = 0.0111   →  ≈ 67.6 path‑traced samples
 ```
 
 So **one physically cast ray + inference ≈ 68 path‑traced samples** on this unseen view
-(`research/results/convergence.png`). The measured MC curve is a textbook straight `1/N`
-line in log–log, which independently validates the tracer’s estimator.
-
-**Reproduce:**
+(`research/results/convergence.png`); the measured MC curve is a textbook straight `1/N` line
+in log–log, independently validating the tracer's estimator. See **`research/REPORT.md`** for
+the full write‑up.
 
 ```bash
-# 1) export a multi‑view dataset (1‑spp features + high‑spp targets) from the tracer
 ./.build/release/pathtracer --export --scene cornell --width 256 --height 256 \
       --views 16 --targetSpp 512 --bounces 6 --clamp 8 --out research/data
-
-# 2) train + evaluate the amplifier on held‑out views (saves comparison.png, model.pt)
 cd research && python3 train.py --data data --out results --epochs 60
-
-# 3) rigorous effective‑sample measurement on a held‑out view (saves convergence.png)
 cd .. && ./.build/release/pathtracer --samplestack --scene cornell --view 15 \
       --width 160 --height 160 --stackM 256 --refSpp 2048 --data research/data --out research/stack
 cd research && python3 eval_amplify.py --stack ../research/stack --model results --out results
 ```
 
-See **`research/REPORT.md`** for the full experiment write‑up, metrics, and honest caveats.
-
 ### Honest framing / limitations
 
-* The amplifier predicts the **integrated radiance** that additional samples would carry
-  (sample amplification / learned cache), conditioned on the single cast ray’s path
-  direction and its 1‑spp radiance — it does **not** synthesize literal extra geometric
-  ray paths. Predicting integrated radiance is the tractable, standard interpretation and
-  is what makes the “one ray → many samples” trade quantifiable.
-* Generalization is demonstrated **across camera views of the same scene** (held out), the
-  same online/per‑scene regime as Neural Radiance Caching — **not** across scenes.
-* Inference currently runs in PyTorch for analysis; folding the MLP into the Metal render
-  loop (via MPSGraph/Core ML) for end‑to‑end realtime amplification is future work.
+* **Per‑scene, not cross‑scene.** Like Neural Radiance Caching, each network is trained on one
+  scene's lighting and geometry and generalises across **held‑out camera views** of that scene,
+  not to unseen scenes. Re‑training is the deployment model.
+* **The realtime path is genuinely in‑Metal**, but only for the per‑pixel MLP; the U‑Net and
+  temporal models still run in PyTorch/MPS for analysis (the `play.py` viewer drives them over
+  the resident `--gbufserver`). Porting the U‑Net to MPSGraph is future work.
+* The amplifier predicts the **integrated radiance** extra samples would carry (a learned
+  cache), not literal extra geometric paths — the tractable, standard interpretation that makes
+  the "one ray → many samples" trade quantifiable.
+* Numbers are tonemapped PSNR on held‑out frames at the noted resolutions; the U‑Net (32.3 dB,
+  showcase) and per‑pixel MLP (27.0 dB, Sponza) are measured on different scenes and are not
+  directly comparable.
 
-## 6. References
+## 7. References
 
 * M. Pharr, W. Jakob, G. Humphreys — *Physically Based Rendering* (path‑tracing integrator, MIS, BDPT).
 * T. Müller et al. — *Real‑time Neural Radiance Caching for Path Tracing*, SIGGRAPH 2021.
